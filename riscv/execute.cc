@@ -40,13 +40,12 @@ static void commit_log_print_value(FILE *log_file, int width, const void *data)
       fprintf(log_file, "0x%016" PRIx64, *(const uint64_t *)data);
       break;
     default:
-      // max lengh of vector
-      if (((width - 1) & width) == 0) {
-        const uint64_t *arr = (const uint64_t *)data;
+      if (width % 8 == 0) {
+        const uint8_t *arr = (const uint8_t *)data;
 
         fprintf(log_file, "0x");
-        for (int idx = width / 64 - 1; idx >= 0; --idx) {
-          fprintf(log_file, "%016" PRIx64, arr[idx]);
+        for (int idx = width / 8 - 1; idx >= 0; --idx) {
+          fprintf(log_file, "%02" PRIx8, arr[idx]);
         }
       } else {
         abort();
@@ -202,7 +201,7 @@ static inline reg_t execute_insn_logged(processor_t* p, reg_t pc, insn_fetch_t f
   return npc;
 }
 
-bool processor_t::slow_path()
+bool processor_t::slow_path() const
 {
   return debug || state.single_step != state.STEP_NONE || state.debug_mode ||
          log_commits_enabled || histogram_enabled || in_wfi || check_triggers_icount;
@@ -211,20 +210,31 @@ bool processor_t::slow_path()
 // fetch/decode/execute loop
 void processor_t::step(size_t n)
 {
+  mmu_t* _mmu = mmu;
+
   if (!state.debug_mode) {
     if (halt_request == HR_REGULAR) {
       enter_debug_mode(DCSR_CAUSE_DEBUGINT, 0);
     } else if (halt_request == HR_GROUP) {
       enter_debug_mode(DCSR_CAUSE_GROUP, 0);
-    } else if (state.dcsr->halt) {
+    } else if (halt_on_reset) {
+      halt_on_reset = false;
       enter_debug_mode(DCSR_CAUSE_HALT, 0);
+    }
+  }
+
+  if (extension_enabled(EXT_ZICCID)) {
+    // Ziccid requires stores eventually become visible to instruction fetch,
+    // so periodically flush the I$
+    if (ziccid_flush_count-- == 0) {
+      ziccid_flush_count += ZICCID_FLUSH_PERIOD;
+      _mmu->flush_icache();
     }
   }
 
   while (n > 0) {
     size_t instret = 0;
     reg_t pc = state.pc;
-    mmu_t* _mmu = mmu;
     state.prv_changed = false;
     state.v_changed = false;
 
@@ -342,10 +352,6 @@ void processor_t::step(size_t n)
     }
     catch (triggers::matched_t& t)
     {
-      if (mmu->matched_trigger) {
-        delete mmu->matched_trigger;
-        mmu->matched_trigger = NULL;
-      }
       take_trigger_action(t.action, t.address, pc, t.gva);
     }
     catch(trap_debug_mode&)
@@ -364,10 +370,10 @@ void processor_t::step(size_t n)
       in_wfi = true;
     }
 
-    state.minstret->bump(instret);
+    state.minstret->bump((state.mcountinhibit->read() & MCOUNTINHIBIT_IR) ? 0 : instret);
 
     // Model a hart whose CPI is 1.
-    state.mcycle->bump(instret);
+    state.mcycle->bump((state.mcountinhibit->read() & MCOUNTINHIBIT_CY) ? 0 : instret);
 
     n -= instret;
   }
